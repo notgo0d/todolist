@@ -2,11 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sqlite3.h>
 
 #define MAX_TASKS 100
 #define TASK_LENGTH 256
 #define NOTE_LENGTH 1024
-#define FILENAME "tasks.txt"
+#define DB_FILENAME "todo.db"
 
 typedef enum {
     PRIORITY_DAILY = -1,
@@ -28,10 +29,13 @@ typedef struct {
 
 Task tasks[MAX_TASKS];
 int task_count = 0;
+sqlite3 *db;
 
 GtkWidget *task_entry;
 GtkWidget *task_grid;
 
+// Function prototypes
+void init_database();
 void save_tasks();
 void load_tasks();
 void add_task(GtkEntry *entry, gpointer data);
@@ -49,6 +53,114 @@ GtkWidget* create_task_widget(int index);
 const char* get_priority_name(TaskPriority priority);
 void show_error_dialog(GtkWindow *parent, const char *message);
 void show_info_dialog(GtkWindow *parent, const char *message);
+
+void init_database() {
+    int rc = sqlite3_open(DB_FILENAME, &db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        exit(1);
+    }
+
+    char *sql = "CREATE TABLE IF NOT EXISTS tasks ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "task TEXT NOT NULL,"
+                "completed INTEGER DEFAULT 0,"
+                "daily INTEGER DEFAULT 0,"
+                "priority INTEGER DEFAULT 0,"
+                "note TEXT DEFAULT '',"
+                "created_at INTEGER,"
+                "completed_at INTEGER,"
+                "note_visible INTEGER DEFAULT 0);";
+    
+    char *err_msg = 0;
+    rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
+        exit(1);
+    }
+}
+
+void save_tasks() {
+    // Clear existing data
+    char *sql = "DELETE FROM tasks;";
+    char *err_msg = 0;
+    int rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        return;
+    }
+
+    // Insert all current tasks
+    sqlite3_stmt *stmt;
+    const char *insert_sql = "INSERT INTO tasks (task, completed, daily, priority, note, created_at, completed_at, note_visible) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
+    
+    rc = sqlite3_prepare_v2(db, insert_sql, -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        return;
+    }
+
+    for (int i = 0; i < task_count; i++) {
+        sqlite3_bind_text(stmt, 1, tasks[i].task, -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 2, tasks[i].completed);
+        sqlite3_bind_int(stmt, 3, tasks[i].daily);
+        sqlite3_bind_int(stmt, 4, tasks[i].priority);
+        sqlite3_bind_text(stmt, 5, tasks[i].note, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 6, tasks[i].created_at);
+        sqlite3_bind_int64(stmt, 7, tasks[i].completed_at);
+        sqlite3_bind_int(stmt, 8, tasks[i].note_visible);
+
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE) {
+            fprintf(stderr, "Execution failed: %s\n", sqlite3_errmsg(db));
+        }
+
+        sqlite3_reset(stmt);
+    }
+
+    sqlite3_finalize(stmt);
+}
+
+void load_tasks() {
+    task_count = 0;
+    
+    const char *sql = "SELECT task, completed, daily, priority, note, created_at, completed_at, note_visible FROM tasks;";
+    sqlite3_stmt *stmt;
+    
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        return;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW && task_count < MAX_TASKS) {
+        Task *t = &tasks[task_count];
+        
+        strncpy(t->task, (const char*)sqlite3_column_text(stmt, 0), TASK_LENGTH - 1);
+        t->task[TASK_LENGTH - 1] = '\0';
+        
+        t->completed = sqlite3_column_int(stmt, 1);
+        t->daily = sqlite3_column_int(stmt, 2);
+        t->priority = sqlite3_column_int(stmt, 3);
+        
+        const char *note = (const char*)sqlite3_column_text(stmt, 4);
+        strncpy(t->note, note ? note : "", NOTE_LENGTH - 1);
+        t->note[NOTE_LENGTH - 1] = '\0';
+        
+        t->created_at = sqlite3_column_int64(stmt, 5);
+        t->completed_at = sqlite3_column_int64(stmt, 6);
+        t->note_visible = sqlite3_column_int(stmt, 7);
+        
+        task_count++;
+    }
+
+    sqlite3_finalize(stmt);
+}
 
 void show_error_dialog(GtkWindow *parent, const char *message) {
     GtkWidget *dialog = gtk_message_dialog_new(parent,
@@ -68,67 +180,6 @@ void show_info_dialog(GtkWindow *parent, const char *message) {
                                              "%s", message);
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
-}
-
-void save_tasks() {
-    FILE *file = fopen(FILENAME, "w");
-    if (!file) {
-        show_error_dialog(NULL, "Failed to save tasks to file.");
-        return;
-    }
-    
-    for (int i = 0; i < task_count; i++) {
-        fprintf(file, "%ld|%ld|%s|%d|%d|%d|%s\n", 
-                tasks[i].created_at,
-                tasks[i].completed_at,
-                tasks[i].task, 
-                tasks[i].completed,
-                tasks[i].daily,
-                tasks[i].priority,
-                tasks[i].note);
-    }
-    
-    fclose(file);
-}
-
-void load_tasks() {
-    FILE *file = fopen(FILENAME, "r");
-    if (!file) return;
-    
-    char line[TASK_LENGTH + NOTE_LENGTH + 100];
-    while (fgets(line, sizeof(line), file) && task_count < MAX_TASKS) {
-        Task *t = &tasks[task_count];
-        t->note_visible = FALSE;
-        
-        char *token = strtok(line, "|");
-        if (!token) continue;
-        t->created_at = atol(token);
-        
-        token = strtok(NULL, "|");
-        t->completed_at = token ? atol(token) : 0;
-        
-        token = strtok(NULL, "|");
-        if (!token) continue;
-        strncpy(t->task, token, TASK_LENGTH - 1);
-        t->task[TASK_LENGTH - 1] = '\0';
-        
-        token = strtok(NULL, "|");
-        t->completed = token ? atoi(token) : 0;
-        
-        token = strtok(NULL, "|");
-        t->daily = token ? atoi(token) : 0;
-        
-        token = strtok(NULL, "|");
-        t->priority = token ? atoi(token) : PRIORITY_LOW;
-        
-        token = strtok(NULL, "\n");
-        strncpy(t->note, token ? token : "", NOTE_LENGTH - 1);
-        t->note[NOTE_LENGTH - 1] = '\0';
-        
-        task_count++;
-    }
-    
-    fclose(file);
 }
 
 void toggle_completion(GtkWidget *widget, gpointer data) {
@@ -479,11 +530,15 @@ void add_task(GtkEntry *entry, gpointer data) {
 
 void on_window_destroy(GtkWidget *widget, gpointer data) {
     save_tasks();
+    sqlite3_close(db);
     gtk_main_quit();
 }
 
 int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
+    
+    // Initialize database
+    init_database();
     
     GtkCssProvider *provider = gtk_css_provider_new();
     gtk_css_provider_load_from_data(provider,
